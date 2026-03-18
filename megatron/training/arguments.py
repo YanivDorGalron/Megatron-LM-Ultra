@@ -624,6 +624,18 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank
             )
+    if getattr(args, 'mtp_hsm_mode', None) is not None:
+        has_prerequisites = (args.mtp_num_layers and args.mtp_num_layers >= 2)
+        if not has_prerequisites:
+            # Auto-disable HSM when prerequisites aren't met
+            args.mtp_hsm_mode = None
+
+    if getattr(args, 'mtp_kd_logit_enabled', False):
+        assert args.mtp_num_layers, (
+            "MTP Knowledge Distillation (--mtp-kd-logit-enabled) "
+            "requires --mtp-num-layers to be set."
+        )
+
     # === End of MTP validation ===
     
     # Uneven virtual pipeline parallelism
