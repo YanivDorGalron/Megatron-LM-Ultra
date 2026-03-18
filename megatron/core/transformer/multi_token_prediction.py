@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
@@ -45,6 +46,47 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
+
+def _hsm_mix(hidden_states_list, mode):
+    """Mix accumulated hidden states for Hidden State Mixing (HSM).
+
+    Args:
+        hidden_states_list: list of tensors, each [s, b, h]
+        mode: 'uniform_layer_sample' or 'exponential_sparse_replace'
+    Returns:
+        mixed hidden states tensor [s, b, h]
+    """
+    n = len(hidden_states_list)
+
+    if mode == 'uniform_layer_sample':
+        s, b, h = hidden_states_list[0].shape
+        indices = torch.randint(0, n, (s, b, 1), device=hidden_states_list[0].device)
+        stacked = torch.stack(hidden_states_list, dim=0)  # [n, s, b, h]
+        one_hot = (
+            torch.arange(n, device=indices.device).view(n, 1, 1, 1) == indices.unsqueeze(0)
+        ).float()
+        return (stacked * one_hot).sum(dim=0)
+
+    elif mode == 'exponential_sparse_replace':
+        # Start from the base (first) hidden state and progressively overwrite
+        # random positions with each subsequent layer's hidden states.
+        # The number of replaced positions decreases exponentially: seq_len // 2^i.
+        s, b, h = hidden_states_list[0].shape
+        device = hidden_states_list[0].device
+        result = hidden_states_list[0].clone()
+        for i, hs in enumerate(hidden_states_list[1:], start=1):
+            num_to_replace = max(1, s // (2 ** i))
+            rand_indices = torch.stack([
+                torch.randperm(s, device=device)[:num_to_replace]
+                for _ in range(b)
+            ], dim=0)  # [b, num_to_replace]
+            for batch_idx in range(b):
+                result[rand_indices[batch_idx], batch_idx, :] = hs[rand_indices[batch_idx], batch_idx, :]
+        return result
+
+    else:
+        raise ValueError(f"Unknown HSM mode: {mode}")
+
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -360,10 +402,31 @@ class MTPLossLoggingHelper:
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
+    @staticmethod
+    def save_kd_loss_to_tracker(
+        kd_logit_loss: Optional[torch.Tensor],
+        layer_number: int,
+        num_layers: int,
+        avg_group: torch.distributed.ProcessGroup = None,
+    ):
+        """Save KD logit loss for logging."""
+        if layer_number is None or kd_logit_loss is None:
+            return
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "kd_logit_loss_values" not in tracker:
+            tracker["kd_logit_loss_values"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+        tracker["kd_logit_loss_values"][layer_number] += kd_logit_loss.detach()
+        tracker["avg_group"] = avg_group
+
     def clean_loss_in_tracker():
         """Clear the mtp losses."""
         tracker = MTPLossLoggingHelper.tracker
         tracker["values"].zero_()
+        if "kd_logit_loss_values" in tracker:
+            tracker["kd_logit_loss_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
@@ -372,14 +435,17 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "values" not in tracker:
             return
-        values = tracker["values"]
-        # Reduce mtp losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+        for key in ["values", "kd_logit_loss_values"]:
+            if key not in tracker:
+                continue
+            values = tracker[key]
+            # Reduce mtp losses across ranks.
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
 
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
@@ -401,6 +467,19 @@ class MTPLossLoggingHelper:
                 writer.add_scalar(name, loss, iteration)
             if wandb_writer is not None:
                 wandb_writer.log({f"{name}": loss}, iteration)
+
+        # Log KD logit loss if present
+        if "kd_logit_loss_values" in tracker:
+            kd_values = tracker["kd_logit_loss_values"] * loss_scale
+            for i in range(mtp_num_layers):
+                name = f"mtp_{i + 1}_kd_logit_loss"
+                val = kd_values[i]
+                if total_loss_dict is not None:
+                    total_loss_dict[name] = total_loss_dict.get(name, 0) + val
+                if writer is not None:
+                    writer.add_scalar(name, val, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({name: val}, iteration)
 
         MTPLossLoggingHelper.clean_loss_in_tracker()
 
@@ -657,9 +736,20 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    logit_kd_enabled = (
+        getattr(config, 'mtp_kd_logit_enabled', False) and is_training
+    )
+    mtp_disable_ce_loss = getattr(config, 'mtp_disable_ce_loss', False)
+
+    # For KD: base_hidden_for_kd starts as hidden_states_list[0] (base model output)
+    # and is rolled once per iteration to align with the target positions.
+    if logit_kd_enabled:
+        base_hidden_for_kd = hidden_states_list[0].detach()  # [s, b, h]
+
     for mtp_layer_number in range(config.mtp_num_layers):
+        mtp_hidden = hidden_states_list[mtp_layer_number + 1]
         mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
+            mtp_hidden,
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
         )
@@ -669,35 +759,97 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-        mtp_loss = loss_mask * mtp_loss
-        if is_training:
-            mtp_loss_for_log = (
-                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
+
+        # --- Roll base hidden states for logit KD ---
+        if logit_kd_enabled:
+            base_hidden_for_kd, _ = roll_tensor(
+                base_hidden_for_kd.permute(1, 2, 0),  # [b, h, s]
+                shifts=-1, dims=-1,
+                cp_group=cp_group, packed_seq_params=packed_seq_params,
             )
-            MTPLossLoggingHelper.save_loss_to_tracker(
-                mtp_loss_for_log,
+            base_hidden_for_kd = base_hidden_for_kd.permute(2, 0, 1)  # [s, b, h]
+
+        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        safe_num_tokens = num_tokens.clamp(min=1)
+
+        # --- CE loss ---
+        if not mtp_disable_ce_loss:
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+            mtp_loss = loss_mask * mtp_loss
+            if is_training:
+                mtp_loss_for_log = (
+                    torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
+                )
+                MTPLossLoggingHelper.save_loss_to_tracker(
+                    mtp_loss_for_log,
+                    mtp_layer_number,
+                    config.mtp_num_layers,
+                    avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                )
+            if config.calculate_per_token_loss:
+                # When calculate_per_token_loss is enabled, finalize_model_grads will
+                # divide all gradients by total_num_tokens (from main loss).
+                # However, MTP has fewer valid tokens due to rolling. To ensure correct
+                # per-token gradient weighting, we normalize by the rolled token count
+                # and re-scale by the original token count.
+                # Avoid division by zero
+                num_tokens_safe = torch.clamp(num_tokens, min=1)
+                mtp_loss_normalized = (
+                    mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+                )
+                hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
+            else:
+                hidden_states = MTPLossAutoScaler.apply(
+                    hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+                )
+
+        # --- Logit KD ---
+        kd_logit_loss_scalar = None
+        if logit_kd_enabled:
+            with torch.no_grad():
+                base_logits_kd, _ = output_layer(
+                    base_hidden_for_kd,
+                    weight=output_weight,
+                    runtime_gather_output=True,
+                )
+            if runtime_gather_output:
+                mtp_logits_kd = mtp_logits
+            else:
+                mtp_logits_kd, _ = output_layer(
+                    mtp_hidden,
+                    weight=output_weight,
+                    runtime_gather_output=True,
+                )
+            T = config.mtp_kd_logit_temperature
+            student_log = F.log_softmax(mtp_logits_kd / T, dim=-1)
+            teacher_p = F.softmax(base_logits_kd / T, dim=-1)
+            kd_logit_per_token = F.kl_div(
+                student_log, teacher_p, reduction='none'
+            ).sum(-1)  # [s, b]
+            kd_logit_loss = kd_logit_per_token.transpose(0, 1) * (T**2) * loss_mask  # [b, s]
+
+            kd_logit_scale = (
+                config.mtp_kd_logit_loss_weight
+                * config.mtp_loss_scaling_factor
+                / config.mtp_num_layers
+            )
+            if config.calculate_per_token_loss:
+                hidden_states = MTPLossAutoScaler.apply(
+                    hidden_states, kd_logit_scale * kd_logit_loss
+                )
+            else:
+                hidden_states = MTPLossAutoScaler.apply(
+                    hidden_states, kd_logit_scale * kd_logit_loss / safe_num_tokens
+                )
+            kd_logit_loss_scalar = torch.sum(kd_logit_loss) / safe_num_tokens
+
+        # --- Log KD losses ---
+        if logit_kd_enabled:
+            MTPLossLoggingHelper.save_kd_loss_to_tracker(
+                kd_logit_loss_scalar,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-            )
-        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
-            # When calculate_per_token_loss is enabled, finalize_model_grads will
-            # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
-        else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
             )
 
     return hidden_states
@@ -1361,12 +1513,26 @@ class MultiTokenPredictionBlock(MegatronModule):
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
+
+        # HSM: Hidden State Mixing accumulates all hidden states and mixes them
+        # as input for subsequent layers. Only active during training.
+        hsm_mode = getattr(self.config, 'mtp_hsm_mode', None) if self.training else None
+        if hsm_mode is not None:
+            hsm_hidden_history = [hidden_states]
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+
+            # Determine input hidden states: HSM mixes accumulated history
+            if hsm_mode is not None and len(hsm_hidden_history) > 1:
+                hs_input = _hsm_mix(hsm_hidden_history, hsm_mode)
+            else:
+                hs_input = hidden_states
+
             (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
-                hidden_states=hidden_states,
+                hidden_states=hs_input,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1377,6 +1543,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 **(extra_block_kwargs or {}),
             )
+
+            # Accumulate for HSM mixing in subsequent layers
+            if hsm_mode is not None:
+                hsm_hidden_history.append(hidden_states)
 
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
