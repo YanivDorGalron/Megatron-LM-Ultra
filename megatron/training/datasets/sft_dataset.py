@@ -19,7 +19,7 @@ class SFTLowLevelDataset:
 
     Args:
         dataset_path (str): The path to jsonl data
-            Each line of the jsonl must have key "messages" (List[Dict]),
+            Each line of the jsonl must have key "messages" or "conversations" (List[Dict]),
             which is a sequence of system/user/assistant messages.
             Must be in the following format:
             [
@@ -27,9 +27,12 @@ class SFTLowLevelDataset:
                 {"role": "user", "content": "something1"},
                 {"role": "assistant", "content": "something2"},
             ]
-            A jsonl line can contain multiple conversations packed together into on list. Each
+            A jsonl line can contain multiple conversations packed together into one list. Each
             conversation starts with the system role, and conversations can have multiple turns
             of the user and assistant roles.
+
+            Use "conversations" when the JSONL originates from on-policy / SDG pipelines
+            that use that key name, and "messages" for the standard OpenAI chat format.
     """
 
     def __init__(self, dataset_path: str) -> None:
@@ -41,11 +44,22 @@ class SFTLowLevelDataset:
             )
         self.dataset = load_dataset("json", data_files=dataset_path, split="all")
 
+        # Auto-detect the messages key: support both "messages" and "conversations".
+        if "messages" in self.dataset.column_names:
+            self._messages_key = "messages"
+        elif "conversations" in self.dataset.column_names:
+            self._messages_key = "conversations"
+        else:
+            raise ValueError(
+                f"JSONL data must have a 'messages' or 'conversations' key. "
+                f"Found columns: {self.dataset.column_names}"
+            )
+
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+        return self.dataset[idx][self._messages_key]
 
 
 class SFTDataset(MegatronDataset):

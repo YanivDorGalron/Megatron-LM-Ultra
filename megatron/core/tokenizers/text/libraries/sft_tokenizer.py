@@ -17,6 +17,17 @@ except ModuleNotFoundError:
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
+sdg_im_think_template = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "{{ '<|im_start|>system\n' + message['content'].strip() + '<|im_end|>\n' }}"
+    "{% elif message['role'] == 'user' %}"
+    "{{ '<|im_start|>user\n' + message['content'].strip() + '<|im_end|>\n' }}"
+    "{% elif message['role'] == 'assistant' %}"
+    "{{ '<|im_start|>assistant\n<think>\n' + message['content'].strip() + '<|im_end|>\n' }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
 # fmt: on
 
 
@@ -88,6 +99,14 @@ class SFTTokenizer:
                 assistant_prefix_len=0,
                 pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
                 custom_chat_template=identity_template,
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "sdg-im-think":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=6,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=sdg_im_think_template,
                 has_bos=False,
                 has_system_role=True,
             )
