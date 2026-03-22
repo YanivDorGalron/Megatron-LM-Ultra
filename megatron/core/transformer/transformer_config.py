@@ -62,6 +62,10 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    freeze_base_model_for_mtp: bool = False
+    """Freeze all base model parameters and run the decoder under torch.no_grad()
+    to avoid storing activations for the backward pass through the frozen layers."""
+
     mtp_disable_ce_loss: bool = False
     """Disable the standard cross-entropy MTP loss, keeping only KD losses."""
 

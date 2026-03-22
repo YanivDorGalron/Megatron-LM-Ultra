@@ -630,6 +630,11 @@ def validate_args(args, defaults={}):
             # Auto-disable HSM when prerequisites aren't met
             args.mtp_hsm_mode = None
 
+    if getattr(args, 'freeze_base_model_for_mtp', False):
+        assert args.mtp_num_layers, (
+            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
+        )
+
     if getattr(args, 'mtp_kd_logit_enabled', False):
         assert args.mtp_num_layers, (
             "MTP Knowledge Distillation (--mtp-kd-logit-enabled) "
