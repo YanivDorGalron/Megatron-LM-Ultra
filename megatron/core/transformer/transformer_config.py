@@ -66,21 +66,9 @@ class TransformerConfig(ModelParallelConfig):
     """Freeze all base model parameters and run the decoder under torch.no_grad()
     to avoid storing activations for the backward pass through the frozen layers."""
 
-    mtp_disable_ce_loss: bool = False
-    """Disable the standard cross-entropy MTP loss, keeping only KD losses."""
-
-    mtp_kd_logit_enabled: bool = False
-    """Enable logit-level KD: KL(base_logits_shifted || mtp_logits)."""
-
-    mtp_kd_logit_temperature: float = 1.0
-    """Softmax temperature for logit KD. Higher = softer distributions."""
-
-    mtp_kd_logit_loss_weight: float = 1.0
-    """Weight of logit KD loss (multiplied by mtp_loss_scaling_factor)."""
-
     mtp_hsm_mode: Optional[str] = None
-    """Hidden State Mixing mode for MTP. Options: 'uniform_avg', 'random_weights',
-    'uniform_layer_sample', 'exponential_sparse_replace'. When None, HSM is disabled."""
+    """Hidden State Mixing mode for MTP. Options: 'uniform_layer_sample'.
+    When None, HSM is disabled."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_override_pattern instead.

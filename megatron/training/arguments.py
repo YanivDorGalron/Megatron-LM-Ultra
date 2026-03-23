@@ -635,12 +635,6 @@ def validate_args(args, defaults={}):
             "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
         )
 
-    if getattr(args, 'mtp_kd_logit_enabled', False):
-        assert args.mtp_num_layers, (
-            "MTP Knowledge Distillation (--mtp-kd-logit-enabled) "
-            "requires --mtp-num-layers to be set."
-        )
-
     # === End of MTP validation ===
     
     # Uneven virtual pipeline parallelism
