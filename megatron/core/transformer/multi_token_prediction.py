@@ -1396,9 +1396,26 @@ class MultiTokenPredictionBlock(MegatronModule):
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 
-            # Determine input hidden states: HSM mixes accumulated history
-            if hsm_mode is not None and len(hsm_hidden_history) > 1:
-                hs_input = _hsm_mix(hsm_hidden_history, hsm_mode)
+            # HSM: diagonal alignment + mixing of accumulated hidden states.
+            # Shift older entries by -1 so all entries at position i correspond
+            # to the same target token. Entry j accumulates (k - j) total rolls
+            # by iteration k. The last entry (just appended) needs 0 shifts.
+            if hsm_mode is not None and len(hidden_states_history) > 1:
+                entries_to_roll = hidden_states_history[:-1]
+                last_entry = hidden_states_history[-1]
+                n = len(entries_to_roll)
+                s, b, h = entries_to_roll[0].shape
+                stacked = torch.stack(entries_to_roll, dim=0)  # [n, s, b, h]
+                flat = stacked.permute(0, 2, 3, 1).reshape(n * b, h, s)  # [n*b, h, s]
+                rolled, _ = roll_tensor(
+                    flat, shifts=-1, dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                hidden_states_history = list(
+                    rolled.reshape(n, b, h, s).permute(0, 3, 1, 2).unbind(0)
+                ) + [last_entry]
+                hs_input = _hsm_mix(hidden_states_history, hsm_mode)
             else:
                 hs_input = hidden_states
 
