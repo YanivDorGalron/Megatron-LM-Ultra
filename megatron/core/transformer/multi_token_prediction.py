@@ -1527,9 +1527,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             # Shift older entries by -1 so all entries at position i correspond
             # to the same target token. Entry j accumulates (k - j) total rolls
             # by iteration k. The last entry (just appended) needs 0 shifts.
-            if hsm_mode is not None and len(hidden_states_history) > 1:
-                entries_to_roll = hidden_states_history[:-1]
-                last_entry = hidden_states_history[-1]
+            if hsm_mode is not None and len(hsm_hidden_history) > 1:
+                entries_to_roll = hsm_hidden_history[:-1]
+                last_entry = hsm_hidden_history[-1]
                 n = len(entries_to_roll)
                 s, b, h = entries_to_roll[0].shape
                 stacked = torch.stack(entries_to_roll, dim=0)  # [n, s, b, h]
@@ -1539,10 +1539,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                 )
-                hidden_states_history = list(
+                hsm_hidden_history = list(
                     rolled.reshape(n, b, h, s).permute(0, 3, 1, 2).unbind(0)
                 ) + [last_entry]
-                hs_input = _hsm_mix(hidden_states_history, hsm_mode)
+                hs_input = _hsm_mix(hsm_hidden_history, hsm_mode)
             else:
                 hs_input = hidden_states
 
