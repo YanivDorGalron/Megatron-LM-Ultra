@@ -641,6 +641,12 @@ def validate_args(args, defaults={}):
             "requires --mtp-num-layers to be set."
         )
 
+    if getattr(args, 'mtp_share_kv', False):
+        assert args.mtp_num_layers and args.mtp_num_layers >= 2, (
+            "--mtp-share-kv requires --mtp-num-layers >= 2 "
+            "(first layer does regular attention, subsequent layers reuse K,V)."
+        )
+
     # === End of MTP validation ===
     
     # Uneven virtual pipeline parallelism

@@ -23,6 +23,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -1396,6 +1397,53 @@ class MultiTokenPredictionBlock(MegatronModule):
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = pg_collection.cp
 
+        self.share_kv = config.mtp_share_kv
+        # Cache SelfAttention modules per layer for shared KV (avoids repeated tree walks)
+        if self.share_kv:
+            self._attn_modules_per_layer = {
+                i: [m for m in layer.modules() if isinstance(m, SelfAttention)]
+                for i, layer in enumerate(self.layers)
+            }
+
+    def _set_kv_capture(self, enabled):
+        """Enable or disable K,V capture on all attention modules across all MTP layers.
+        Always clears shared KV state to prevent stale data between steps."""
+        for layer_idx in self._attn_modules_per_layer:
+            for attn in self._attn_modules_per_layer[layer_idx]:
+                attn._mtp_capture_kv = enabled
+                attn._mtp_shared_kv = None
+
+    def _get_attn_modules(self, layer_idx):
+        """Get cached SelfAttention modules for a given layer index."""
+        return self._attn_modules_per_layer[layer_idx]
+
+    def _collect_captured_kv(self, layer_idx):
+        """Collect captured K,V from all attention modules within the MTP layer.
+
+        Returns:
+            list of (key, value) tuples, one per attention module.
+        """
+        kv_list = []
+        for attn in self._get_attn_modules(layer_idx):
+            if attn._mtp_captured_kv is not None:
+                kv_list.append(attn._mtp_captured_kv)
+                attn._mtp_captured_kv = None
+        return kv_list
+
+    def _set_shared_kv(self, layer_idx, kv_list):
+        """Set shared K,V on all attention modules within the MTP layer.
+
+        Args:
+            kv_list: list of (key, value) tuples, one per attention module.
+        """
+        attn_modules = self._get_attn_modules(layer_idx)
+        assert len(attn_modules) == len(kv_list), (
+            f"Number of attention modules ({len(attn_modules)}) does not match "
+            f"number of shared K,V entries ({len(kv_list)})"
+        )
+        for attn, (k, v) in zip(attn_modules, kv_list):
+            attn._mtp_shared_kv = (k, v)
+
     def _build_layers(self, pg_collection):
         # Determine number of depths to build
         if self.mtp_num_depths > 0:
@@ -1520,6 +1568,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         if hsm_mode is not None:
             hsm_hidden_history = [hidden_states]
 
+        prev_kv_list = None
+        if self.share_kv:
+            self._set_kv_capture(True)
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 
@@ -1546,6 +1598,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             else:
                 hs_input = hidden_states
 
+            # Shared KV: inject K,V from the previous iteration
+            if self.share_kv and iteration > 0 and prev_kv_list is not None:
+                self._set_shared_kv(layer_idx, prev_kv_list)
+
             (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -1560,6 +1616,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 **(extra_block_kwargs or {}),
             )
+
+            # Collect captured K,V for the next iteration
+            if self.share_kv:
+                prev_kv_list = self._collect_captured_kv(layer_idx)
 
             # Accumulate for HSM mixing in subsequent layers
             if hsm_mode is not None:
