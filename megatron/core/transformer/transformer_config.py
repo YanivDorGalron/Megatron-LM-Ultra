@@ -70,6 +70,10 @@ class TransformerConfig(ModelParallelConfig):
     """Hidden State Mixing mode for MTP. Options: 'uniform_layer_sample'.
     When None, HSM is disabled."""
 
+    mtp_share_kv: bool = False
+    """Enable shared KV between MTP layers. MTP layer X reuses K,V from layer X-1.
+    First MTP layer always does regular attention. Requires mtp_num_layers >= 2."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_override_pattern instead.
     Legacy argument for loading old checkpoints.
