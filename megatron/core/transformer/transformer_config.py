@@ -78,6 +78,10 @@ class TransformerConfig(ModelParallelConfig):
     mtp_kd_logit_loss_weight: float = 1.0
     """Weight of logit KD loss (multiplied by mtp_loss_scaling_factor)."""
 
+    apply_kd_loss_on_prompts: bool = False
+    """When True, KD losses (logit KL) are computed on all non-padding tokens
+    including user/system prompts, while CE loss remains assistant-only."""
+
     mtp_hsm_mode: Optional[str] = None
     """Hidden State Mixing mode for MTP. Options: 'uniform_avg', 'random_weights',
     'uniform_layer_sample', 'exponential_sparse_replace'. When None, HSM is disabled."""

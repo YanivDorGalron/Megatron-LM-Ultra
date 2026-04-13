@@ -41,6 +41,8 @@ if is_torch_min_version("1.13.0"):
 else:
     dist_all_gather_func = torch.distributed._all_gather_base
 
+IGNORE_INDEX = -100  # Label value used by SFT to mask prompt tokens
+
 SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding,
     AttnMaskType.causal,
@@ -722,7 +724,11 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+    # Curriculum learning: use active layer count if set, else all layers
+    active = MultiTokenPredictionBlock._num_active_mtp_layers
+    num_mtp_iterations = min(active, config.mtp_num_layers) if active is not None else config.mtp_num_layers
+
+    hidden_states_list = torch.chunk(hidden_states, 1 + num_mtp_iterations, dim=0)
     hidden_states = hidden_states_list[0]
 
     if labels is None:
@@ -747,7 +753,7 @@ def process_mtp_loss(
     if logit_kd_enabled:
         base_hidden_for_kd = hidden_states_list[0].detach()  # [s, b, h]
 
-    for mtp_layer_number in range(config.mtp_num_layers):
+    for mtp_layer_number in range(num_mtp_iterations):
         mtp_hidden = hidden_states_list[mtp_layer_number + 1]
         mtp_logits, _ = output_layer(
             mtp_hidden,
@@ -770,8 +776,17 @@ def process_mtp_loss(
             )
             base_hidden_for_kd = base_hidden_for_kd.permute(2, 0, 1)  # [s, b, h]
 
-        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        mtp_loss_scale = config.mtp_loss_scaling_factor / num_mtp_iterations
         safe_num_tokens = num_tokens.clamp(min=1)
+
+        # Derive KD loss mask: include prompt tokens (IGNORE_INDEX in
+        # labels) that are excluded from CE loss_mask.  Padding stays masked.
+        if config.apply_kd_loss_on_prompts:
+            kd_loss_mask = (loss_mask.bool() | (mtp_labels == IGNORE_INDEX)).float()
+            kd_safe_num_tokens = torch.clamp(kd_loss_mask.sum(), min=1).detach()
+        else:
+            kd_loss_mask = loss_mask
+            kd_safe_num_tokens = safe_num_tokens
 
         # --- CE loss ---
         if not mtp_disable_ce_loss:
@@ -827,12 +842,12 @@ def process_mtp_loss(
             kd_logit_per_token = F.kl_div(
                 student_log, teacher_p, reduction='none'
             ).sum(-1)  # [s, b]
-            kd_logit_loss = kd_logit_per_token.transpose(0, 1) * (T**2) * loss_mask  # [b, s]
+            kd_logit_loss = kd_logit_per_token.transpose(0, 1) * (T**2) * kd_loss_mask  # [b, s]
 
             kd_logit_scale = (
                 config.mtp_kd_logit_loss_weight
                 * config.mtp_loss_scaling_factor
-                / config.mtp_num_layers
+                / num_mtp_iterations
             )
             if config.calculate_per_token_loss:
                 hidden_states = MTPLossAutoScaler.apply(
@@ -840,9 +855,9 @@ def process_mtp_loss(
                 )
             else:
                 hidden_states = MTPLossAutoScaler.apply(
-                    hidden_states, kd_logit_scale * kd_logit_loss / safe_num_tokens
+                    hidden_states, kd_logit_scale * kd_logit_loss / kd_safe_num_tokens
                 )
-            kd_logit_loss_scalar = torch.sum(kd_logit_loss) / safe_num_tokens
+            kd_logit_loss_scalar = torch.sum(kd_logit_loss) / kd_safe_num_tokens
 
         # --- Log KD losses ---
         if logit_kd_enabled:
@@ -1354,6 +1369,20 @@ class MultiTokenPredictionBlock(MegatronModule):
     https://arxiv.org/pdf/2412.19437.pdf
     """
 
+    # Class-level attribute for curriculum learning.
+    # None = use all layers (default behavior). Set from training loop.
+    _num_active_mtp_layers: Optional[int] = None
+
+    @classmethod
+    def set_num_active_mtp_layers(cls, n: Optional[int]):
+        """Set the number of active MTP layers for curriculum learning."""
+        cls._num_active_mtp_layers = n
+
+    @classmethod
+    def get_num_active_mtp_layers(cls) -> Optional[int]:
+        """Get the current number of active MTP layers."""
+        return cls._num_active_mtp_layers
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1572,7 +1601,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.share_kv:
             self._set_kv_capture(True)
 
-        for iteration in range(self.config.mtp_num_layers):
+        max_iterations = self.config.mtp_num_layers
+        active = MultiTokenPredictionBlock._num_active_mtp_layers
+        num_iterations = min(active, max_iterations) if active is not None else max_iterations
+        for iteration in range(num_iterations):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 
             # HSM: diagonal alignment + mixing of accumulated hidden states.

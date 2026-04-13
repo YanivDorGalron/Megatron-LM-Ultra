@@ -144,7 +144,7 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper, MultiTokenPredictionBlock
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_global_symmetric_memory_buffer,
@@ -204,6 +204,19 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+
+def _compute_mtp_curriculum_active_layers(args, iteration):
+    """Compute the number of active MTP layers for curriculum learning.
+
+    Returns None if curriculum learning is not enabled.
+    """
+    start = getattr(args, 'mtp_curriculum_start_layers', None)
+    if start is None:
+        return None
+    interval = getattr(args, 'mtp_curriculum_step_interval', 5000)
+    max_layers = args.mtp_num_layers
+    return min(start + iteration // interval, max_layers)
 
 
 def destroy_global_state():
@@ -2782,6 +2795,17 @@ def train(
             optimizers=[optimizer],
         )
 
+    # Initialize MTP curriculum schedule
+    if getattr(args, 'mtp_curriculum_start_layers', None) is not None:
+        initial_active = _compute_mtp_curriculum_active_layers(args, iteration)
+        MultiTokenPredictionBlock.set_num_active_mtp_layers(initial_active)
+        print_rank_0(
+            f"[MTP Curriculum] Starting with {initial_active} active MTP layers "
+            f"(start={args.mtp_curriculum_start_layers}, "
+            f"interval={args.mtp_curriculum_step_interval}, "
+            f"max={args.mtp_num_layers})"
+        )
+
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
@@ -2866,6 +2890,17 @@ def train(
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
             continue
+
+        # Update MTP curriculum schedule
+        if getattr(args, 'mtp_curriculum_start_layers', None) is not None:
+            new_active = _compute_mtp_curriculum_active_layers(args, iteration)
+            old_active = MultiTokenPredictionBlock.get_num_active_mtp_layers()
+            if old_active != new_active:
+                MultiTokenPredictionBlock.set_num_active_mtp_layers(new_active)
+                print_rank_0(
+                    f"[MTP Curriculum] iteration {iteration}: "
+                    f"active MTP layers changed from {old_active} to {new_active}"
+                )
 
         args.curr_iteration = iteration
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.

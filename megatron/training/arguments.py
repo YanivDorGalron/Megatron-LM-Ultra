@@ -647,6 +647,18 @@ def validate_args(args, defaults={}):
             "(first layer does regular attention, subsequent layers reuse K,V)."
         )
 
+    if getattr(args, 'mtp_curriculum_start_layers', None) is not None:
+        assert args.mtp_num_layers, (
+            "--mtp-curriculum-start-layers requires --mtp-num-layers to be set."
+        )
+        assert 1 <= args.mtp_curriculum_start_layers <= args.mtp_num_layers, (
+            f"--mtp-curriculum-start-layers ({args.mtp_curriculum_start_layers}) must be "
+            f"between 1 and --mtp-num-layers ({args.mtp_num_layers})."
+        )
+        assert args.mtp_curriculum_step_interval > 0, (
+            "--mtp-curriculum-step-interval must be positive."
+        )
+
     # === End of MTP validation ===
     
     # Uneven virtual pipeline parallelism
@@ -1884,6 +1896,15 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
+    group.add_argument('--mtp-curriculum-start-layers', type=int, default=None,
+                       help='Starting number of active MTP layers for curriculum learning. '
+                       'Training begins with this many active layers and adds 1 every '
+                       '--mtp-curriculum-step-interval iterations until reaching --mtp-num-layers. '
+                       'Requires --mtp-num-layers to be set.')
+    group.add_argument('--mtp-curriculum-step-interval', type=int, default=5000,
+                       help='Number of training iterations between adding a new active MTP layer '
+                       'during curriculum learning. Default: 5000. '
+                       'Only used when --mtp-curriculum-start-layers is set.')
     return parser
 
 def _add_straggler_detector_args(parser):
