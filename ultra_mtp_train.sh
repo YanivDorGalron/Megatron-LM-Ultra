@@ -42,7 +42,7 @@ export UCX_ERROR_SIGNALS=
 ################################################################
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=16
-export HF_HOME="/lustre/fsw/portfolios/coreai/users/ygalron/.cache/huggingface/"
+export HF_HOME="/lustre/fsw/portfolios/coreai/users/$USER/.cache/huggingface/"
 export TRITON_CACHE_DIR="/tmp/triton-cache"
 
 ################################################################
@@ -61,20 +61,20 @@ LR_DECAY_STYLE=${LR_DECAY_STYLE:-cosine}
 PROMPT_FORMAT=${PROMPT_FORMAT:-identity}
 BLEND_PATH=${BLEND_PATH:-"/lustre/fsw/portfolios/llmservice/users/soumyes/sft-runs/blends/ultra_mar12_3pc_trunc_510k-filtered.part0.json"}
 BASE_MODEL_PATH=${BASE_MODEL_PATH:-"/lustre/fs1/portfolios/coreai/projects/coreai_nvfm_llm/users/ygalron/super_mtp_training/pretrained_ckpts/rl_step_96"}
-MEGATRON_LM_DIR=${MEGATRON_LM_DIR:-"/lustre/fs1/portfolios/coreai/projects/coreai_nvfm_llm/users/ygalron/super_mtp_training/megatron-lm-ultra-sft"}
+MEGATRON_LM_DIR=${MEGATRON_LM_DIR:-"/lustre/fs1/portfolios/coreai/projects/coreai_nvfm_llm/users/$USER/super_mtp_training/megatron-lm-ultra-sft"}
 
 ################################################################
 ### Paths
 ################################################################
 NAME=${SLURM_JOB_NAME}
 
-OUTPUT_ROOT="/lustre/fs1/portfolios/coreai/projects/coreai_nvfm_llm/users/ygalron/super_mtp_training/"
+OUTPUT_ROOT="/lustre/fs1/portfolios/coreai/projects/coreai_nvfm_llm/users/$USER/super_mtp_training/"
 IMAGE="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/containers/pt_ultra_mamba_ssmv230_23jan28.sqsh"
 BINDPCIE_SCRIPT="/lustre/fsw/portfolios/llmservice/users/soumyes/sft-runs/code/bindpcie.sh"
 TOKENIZER_MODEL_PATH="/lustre/fs1/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/adithyare/nemotron_super/tokenizer"
 
 export WANDB_API_KEY="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"
-WANDB_PROJECT="ultra-v3-sft-ygalron"
+WANDB_PROJECT="ultra-v3-sft-$USER"
 
 RUN_DIR="${OUTPUT_ROOT}"
 LOGS_DIR="${RUN_DIR}/logs/${NAME}/"
