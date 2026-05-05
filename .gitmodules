@@ -1,5 +1,5 @@
 [submodule "launch-script"]
 	path = launch-script
-	url = ssh://git@gitlab-master.nvidia.com:12051/ygalron/launch-script.git
+	url = ssh://git@gitlab-master.nvidia.com:12051/deci/inference-algorithms/launch-script.git
 [submodule "launch_scripts"]
 	url = ssh://git@gitlab-master.nvidia.com:12051/deci/inference-algorithms/launch-script.git

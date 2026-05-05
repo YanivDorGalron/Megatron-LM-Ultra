@@ -28,9 +28,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
+    get_pg_size,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -373,6 +375,40 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     return rolled_tensor, rolled_tensor.sum()
 
 
+def _compute_mtp_acceptance_counts(
+    logits: Tensor,
+    labels: Tensor,
+    loss_mask: Tensor,
+    output_layer: Callable,
+) -> tuple[Tensor, Tensor]:
+    """Compute top-1 MTP token accuracy counts, handling vocab-parallel logits."""
+    valid_mask = loss_mask.bool() & (labels != IGNORE_INDEX)
+    total = valid_mask.sum().to(torch.float32)
+
+    output_size = getattr(output_layer, 'output_size', logits.size(-1))
+    tp_group = getattr(output_layer, 'tp_group', None)
+    tp_size = get_pg_size(tp_group)
+    logits_are_gathered = logits.size(-1) == output_size
+
+    if logits_are_gathered or tp_size == 1:
+        predictions = torch.argmax(logits, dim=-1).transpose(0, 1)
+        correct = ((predictions == labels) & valid_mask).sum().to(torch.float32)
+        return correct, total
+
+    local_max, local_indices = torch.max(logits.float(), dim=-1)
+    vocab_start_index, _ = VocabUtility.vocab_range_from_per_partition_vocab_size(
+        logits.size(-1), get_pg_rank(tp_group), tp_size
+    )
+    local_predictions = local_indices.transpose(0, 1) + vocab_start_index
+
+    global_max = local_max.detach().clone()
+    torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+    local_winner = local_max.transpose(0, 1) == global_max.transpose(0, 1)
+    correct = ((local_predictions == labels) & local_winner & valid_mask).sum().to(torch.float32)
+    torch.distributed.all_reduce(correct, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    return correct, total
+
+
 class MTPLossLoggingHelper:
     """Helper class for logging MTP losses."""
 
@@ -406,6 +442,31 @@ class MTPLossLoggingHelper:
         tracker["avg_group"] = avg_group
 
     @staticmethod
+    def save_acceptance_to_tracker(
+        correct: torch.Tensor,
+        total: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        """Save MTP top-1 acceptance counts for logging."""
+        if layer_number is None:
+            return
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "acceptance_correct_values" not in tracker:
+            tracker["acceptance_correct_values"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+        if "acceptance_total_values" not in tracker:
+            tracker["acceptance_total_values"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+        tracker["acceptance_correct_values"][layer_number] += correct.detach()
+        tracker["acceptance_total_values"][layer_number] += total.detach()
+        tracker["avg_group"] = avg_group
+
+    @staticmethod
     def save_kd_loss_to_tracker(
         kd_logit_loss: Optional[torch.Tensor],
         layer_number: int,
@@ -427,16 +488,25 @@ class MTPLossLoggingHelper:
     def clean_loss_in_tracker():
         """Clear the mtp losses."""
         tracker = MTPLossLoggingHelper.tracker
-        tracker["values"].zero_()
+        if "values" in tracker:
+            tracker["values"].zero_()
         if "kd_logit_loss_values" in tracker:
             tracker["kd_logit_loss_values"].zero_()
+        if "acceptance_correct_values" in tracker:
+            tracker["acceptance_correct_values"].zero_()
+        if "acceptance_total_values" in tracker:
+            tracker["acceptance_total_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
     def reduce_loss_in_tracker():
         """Collect and reduce the mtp losses across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if (
+            "values" not in tracker
+            and "kd_logit_loss_values" not in tracker
+            and "acceptance_correct_values" not in tracker
+        ):
             return
         for key in ["values", "kd_logit_loss_values"]:
             if key not in tracker:
@@ -449,32 +519,77 @@ class MTPLossLoggingHelper:
                 torch.distributed.all_reduce(
                     values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
                 )
+        for key in ["acceptance_correct_values", "acceptance_total_values"]:
+            if key not in tracker:
+                continue
+            values = tracker[key]
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+                )
 
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
         MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if (
+            "values" not in tracker
+            and "kd_logit_loss_values" not in tracker
+            and "acceptance_correct_values" not in tracker
+        ):
             return
-        mtp_losses = tracker["values"] * loss_scale
-        mtp_num_layers = mtp_losses.shape[0]
-        for i in range(mtp_num_layers):
-            name = f"mtp_{i + 1} loss"
-            loss = mtp_losses[i]
-            if total_loss_dict is not None:
-                if name in total_loss_dict:
-                    total_loss_dict[name] += loss
-                else:
-                    total_loss_dict[name] = loss
-            if writer is not None:
-                writer.add_scalar(name, loss, iteration)
-            if wandb_writer is not None:
-                wandb_writer.log({f"{name}": loss}, iteration)
+
+        if "values" in tracker:
+            mtp_losses = tracker["values"] * loss_scale
+            for i in range(mtp_losses.shape[0]):
+                name = f"mtp_{i + 1} loss"
+                loss = mtp_losses[i]
+                if total_loss_dict is not None:
+                    if name in total_loss_dict:
+                        total_loss_dict[name] += loss
+                    else:
+                        total_loss_dict[name] = loss
+                if writer is not None:
+                    writer.add_scalar(name, loss, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({f"{name}": loss}, iteration)
+
+        if "acceptance_correct_values" in tracker and "acceptance_total_values" in tracker:
+            correct_values = tracker["acceptance_correct_values"]
+            total_values = tracker["acceptance_total_values"]
+            if "cumulative_acceptance_correct_values" not in tracker:
+                tracker["cumulative_acceptance_correct_values"] = torch.zeros_like(correct_values)
+            if "cumulative_acceptance_total_values" not in tracker:
+                tracker["cumulative_acceptance_total_values"] = torch.zeros_like(total_values)
+            tracker["cumulative_acceptance_correct_values"] += correct_values
+            tracker["cumulative_acceptance_total_values"] += total_values
+
+            for i in range(correct_values.shape[0]):
+                step_name = f"mtp_{i + 1}_acceptance_rate"
+                cum_name = f"mtp_{i + 1}_cumulative_acceptance_rate"
+                step_rate = torch.where(
+                    total_values[i] > 0,
+                    correct_values[i] / total_values[i] * 100.0,
+                    total_values[i],
+                )
+                cum_correct = tracker["cumulative_acceptance_correct_values"][i]
+                cum_total = tracker["cumulative_acceptance_total_values"][i]
+                cum_rate = torch.where(cum_total > 0, cum_correct / cum_total * 100.0, cum_total)
+                if total_loss_dict is not None:
+                    total_loss_dict[step_name] = total_loss_dict.get(step_name, 0) + step_rate
+                if writer is not None:
+                    writer.add_scalar(step_name, step_rate, iteration)
+                    writer.add_scalar(cum_name, cum_rate, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({step_name: step_rate}, iteration)
+                    wandb_writer.log({cum_name: cum_rate}, iteration)
 
         # Log KD logit loss if present
         if "kd_logit_loss_values" in tracker:
             kd_values = tracker["kd_logit_loss_values"] * loss_scale
-            for i in range(mtp_num_layers):
+            for i in range(kd_values.shape[0]):
                 name = f"mtp_{i + 1}_kd_logit_loss"
                 val = kd_values[i]
                 if total_loss_dict is not None:
@@ -766,6 +881,19 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
+
+        if is_training:
+            with torch.no_grad():
+                mtp_correct, mtp_total = _compute_mtp_acceptance_counts(
+                    mtp_logits, mtp_labels, loss_mask, output_layer
+                )
+            MTPLossLoggingHelper.save_acceptance_to_tracker(
+                mtp_correct,
+                mtp_total,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
 
         # --- Roll base hidden states for logit KD ---
         if logit_kd_enabled:
