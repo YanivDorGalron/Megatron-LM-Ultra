@@ -12,7 +12,7 @@
 
 #SBATCH -p batch
 #SBATCH -q normal
-#SBATCH --account=coreai_nvfm_llm
+#SBATCH --account=nemotron_n4_pre
 #SBATCH --ntasks-per-node=4
 #SBATCH --nodes=8
 #SBATCH --time=4:00:00
@@ -132,9 +132,9 @@ echo "<< END ENV >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
 ################################################################
 ### Training hyperparams
 ################################################################
-TRAIN_SAMPLES=1042136
-LR_WARMUP_SAMPLES=6400
-LR_DECAY_SAMPLES=524288
+TRAIN_SAMPLES=320000
+LR_WARMUP_SAMPLES=7500
+LR_DECAY_SAMPLES=312500
 LOG_INTERVAL=1
 GBS=64
 MIN_LR=2e-6
