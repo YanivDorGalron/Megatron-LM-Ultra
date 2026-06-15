@@ -99,6 +99,8 @@ class TestMultiTokenPredictionLayer:
         assert config.mtp_kd_logit_enabled is False
         assert config.mtp_kd_logit_temperature == 1.0
         assert config.mtp_kd_logit_loss_weight == 1.0
+        assert config.mtp_kd_logit_loss_type == "kl"
+        assert config.mtp_lk_eta == 3.0
         assert config.mtp_hsm_mode is None
         assert config.freeze_base_model_for_mtp is False
 
@@ -1176,17 +1178,24 @@ class TestMTPLossLoggingHelper:
     def test_save_kd_loss_to_tracker(self):
         """Test saving KD loss to tracker."""
         kd_loss = torch.tensor(0.7)
+        lk_lambda = torch.tensor(0.2)
         layer_number = 1
         num_layers = self.num_layers
 
         MTPLossLoggingHelper.save_kd_loss_to_tracker(
-            kd_logit_loss=kd_loss, layer_number=layer_number, num_layers=num_layers
+            kd_logit_loss=kd_loss,
+            layer_number=layer_number,
+            num_layers=num_layers,
+            lk_lambda=lk_lambda,
         )
 
         tracker = MTPLossLoggingHelper.tracker
         assert "kd_logit_loss_values" in tracker
         assert tracker["kd_logit_loss_values"].shape == (num_layers,)
         assert tracker["kd_logit_loss_values"][layer_number] == kd_loss
+        assert "lk_lambda_values" in tracker
+        assert tracker["lk_lambda_values"].shape == (num_layers,)
+        assert tracker["lk_lambda_values"][layer_number] == lk_lambda
         assert tracker["avg_group"] is None
 
     def test_mtp_logits_are_vocab_sharded(self):
@@ -1206,6 +1215,7 @@ class TestMTPLossLoggingHelper:
         num_layers = self.num_layers
         loss = torch.tensor(2.3)
         kd_loss = torch.tensor(0.4)
+        lk_lambda = torch.tensor(0.2)
         correct = torch.tensor(7.0)
         total = torch.tensor(10.0)
 
@@ -1214,7 +1224,7 @@ class TestMTPLossLoggingHelper:
                 loss=loss, correct=correct, total=total, layer_number=i, num_layers=num_layers
             )
             MTPLossLoggingHelper.save_kd_loss_to_tracker(
-                kd_logit_loss=kd_loss, layer_number=i, num_layers=num_layers
+                kd_logit_loss=kd_loss, layer_number=i, num_layers=num_layers, lk_lambda=lk_lambda
             )
 
         class DummyWriter:
@@ -1253,6 +1263,11 @@ class TestMTPLossLoggingHelper:
                 torch.as_tensor(writer.scalars[f"mtp_{i+1}_kd_logit_loss"]), expected_kd_loss
             )
             assert torch.isclose(total_loss_dict[f"mtp_{i+1}_kd_logit_loss"], expected_kd_loss)
+            expected_lk_lambda = lk_lambda * loss_scale
+            assert torch.isclose(
+                torch.as_tensor(writer.scalars[f"mtp_{i+1}_lk_lambda"]), expected_lk_lambda
+            )
+            assert torch.isclose(total_loss_dict[f"mtp_{i+1}_lk_lambda"], expected_lk_lambda)
 
         # Verify acceptance rate is computed as (correct / total) * 100
         expected_rate = (correct / total) * 100.0
@@ -1304,6 +1319,7 @@ class TestMTPLossLoggingHelper:
         # Verify tracker is cleaned
         assert torch.all(MTPLossLoggingHelper.tracker["loss_values"] == 0)
         assert torch.all(MTPLossLoggingHelper.tracker["kd_logit_loss_values"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["lk_lambda_values"] == 0)
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 

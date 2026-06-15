@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -78,6 +78,45 @@ def _scale_mtp_loss_for_token_count(
 ) -> Tensor:
     """Scale per-token MTP loss so final gradient division uses rolled-token normalization."""
     return loss_scale * loss * (original_num_tokens / num_tokens.clamp(min=1))
+
+
+def _compute_mtp_kd_logit_loss(
+    student_logits: Tensor,
+    teacher_logits: Tensor,
+    temperature: float,
+    loss_type: str,
+    loss_mask: Optional[Tensor] = None,
+    lk_eta: float = 3.0,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Compute per-token MTP logit KD loss and optional LK diagnostics."""
+    if loss_type == 'kl':
+        student_log = F.log_softmax(student_logits / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+        kd_loss = F.kl_div(student_log, teacher_probs, reduction='none').sum(-1)
+        return kd_loss * (temperature**2), None
+
+    if loss_type != 'lk_lambda':
+        raise ValueError(
+            f"Unknown mtp_kd_logit_loss_type: {loss_type!r}. Expected one of: kl, lk_lambda."
+        )
+
+    teacher_probs = F.softmax(teacher_logits, dim=-1)
+    student_probs = F.softmax(student_logits, dim=-1)
+    overlap = torch.minimum(teacher_probs, student_probs).sum(-1)
+
+    with torch.no_grad():
+        if loss_mask is None:
+            alpha_bar = overlap.mean()
+        else:
+            mask = loss_mask.transpose(0, 1)
+            alpha_bar = (overlap * mask).sum() / mask.sum().clamp(min=1.0)
+
+    student_log = F.log_softmax(student_logits, dim=-1)
+    kl_loss = F.kl_div(student_log, teacher_probs, reduction='none').sum(-1)
+    tv_loss = 1.0 - overlap
+    with torch.no_grad():
+        lk_lambda = torch.exp(-lk_eta * alpha_bar)
+    return lk_lambda * kl_loss + (1.0 - lk_lambda) * tv_loss, lk_lambda
 
 
 if HAVE_TE:
@@ -413,17 +452,25 @@ class MTPLossLoggingHelper:
         layer_number: int,
         num_layers: int,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
+        lk_lambda: Optional[torch.Tensor] = None,
     ):
         """Save the MTP KD logit loss for logging."""
-        if layer_number is None or kd_logit_loss is None:
+        if layer_number is None:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "kd_logit_loss_values" not in tracker:
-            tracker["kd_logit_loss_values"] = torch.zeros(
-                num_layers, device=torch.cuda.current_device()
-            )
-        tracker["kd_logit_loss_values"][layer_number] += kd_logit_loss.detach()
+        if kd_logit_loss is not None:
+            if "kd_logit_loss_values" not in tracker:
+                tracker["kd_logit_loss_values"] = torch.zeros(
+                    num_layers, device=torch.cuda.current_device()
+                )
+            tracker["kd_logit_loss_values"][layer_number] += kd_logit_loss.detach()
+        if lk_lambda is not None:
+            if "lk_lambda_values" not in tracker:
+                tracker["lk_lambda_values"] = torch.zeros(
+                    num_layers, device=torch.cuda.current_device()
+                )
+            tracker["lk_lambda_values"][layer_number] += lk_lambda.detach()
         tracker["avg_group"] = avg_group
 
     @staticmethod
@@ -438,6 +485,8 @@ class MTPLossLoggingHelper:
             tracker["total_values"].zero_()
         if "kd_logit_loss_values" in tracker:
             tracker["kd_logit_loss_values"].zero_()
+        if "lk_lambda_values" in tracker:
+            tracker["lk_lambda_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
@@ -445,10 +494,11 @@ class MTPLossLoggingHelper:
     def reduce_metrics_in_tracker():
         """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker and "kd_logit_loss_values" not in tracker:
+        metric_keys = ["loss_values", "kd_logit_loss_values", "lk_lambda_values"]
+        if not any(key in tracker for key in metric_keys):
             return
 
-        for key in ["loss_values", "kd_logit_loss_values"]:
+        for key in metric_keys:
             if key not in tracker:
                 continue
             values = tracker[key]
@@ -475,7 +525,9 @@ class MTPLossLoggingHelper:
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
         MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker and "kd_logit_loss_values" not in tracker:
+        if not any(
+            key in tracker for key in ["loss_values", "kd_logit_loss_values", "lk_lambda_values"]
+        ):
             return
 
         if "loss_values" in tracker:
@@ -531,6 +583,18 @@ class MTPLossLoggingHelper:
             for i in range(kd_values.shape[0]):
                 name = f"mtp_{i+1}_kd_logit_loss"
                 val = kd_values[i]
+                if total_loss_dict is not None:
+                    total_loss_dict[name] = total_loss_dict.get(name, torch.zeros_like(val)) + val
+                if writer is not None:
+                    writer.add_scalar(name, val, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({name: val}, iteration)
+
+        if "lk_lambda_values" in tracker:
+            lk_values = tracker["lk_lambda_values"] * loss_scale
+            for i in range(lk_values.shape[0]):
+                name = f"mtp_{i+1}_lk_lambda"
+                val = lk_values[i]
                 if total_loss_dict is not None:
                     total_loss_dict[name] = total_loss_dict.get(name, torch.zeros_like(val)) + val
                 if writer is not None:
@@ -968,6 +1032,7 @@ def process_mtp_loss(
                 )
 
         kd_logit_loss_scalar = None
+        lk_lambda_scalar = None
         if logit_kd_enabled:
             with torch.no_grad():
                 base_logits_kd, _ = output_layer(
@@ -990,10 +1055,16 @@ def process_mtp_loss(
             kd_safe_num_tokens = safe_num_tokens
 
             temperature = config.mtp_kd_logit_temperature
-            student_log = F.log_softmax(mtp_logits_kd / temperature, dim=-1)
-            teacher_probs = F.softmax(base_logits_kd / temperature, dim=-1)
-            kd_logit_per_token = F.kl_div(student_log, teacher_probs, reduction='none').sum(-1)
-            kd_logit_loss = kd_logit_per_token.transpose(0, 1) * (temperature**2) * kd_loss_mask
+            loss_type = getattr(config, 'mtp_kd_logit_loss_type', 'kl')
+            kd_logit_per_token, lk_lambda_scalar = _compute_mtp_kd_logit_loss(
+                student_logits=mtp_logits_kd,
+                teacher_logits=base_logits_kd,
+                temperature=temperature,
+                loss_type=loss_type,
+                loss_mask=kd_loss_mask,
+                lk_eta=config.mtp_lk_eta,
+            )
+            kd_logit_loss = kd_logit_per_token.transpose(0, 1) * kd_loss_mask
             kd_logit_scale = (
                 config.mtp_kd_logit_loss_weight
                 * config.mtp_loss_scaling_factor
@@ -1016,6 +1087,7 @@ def process_mtp_loss(
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                lk_lambda=lk_lambda_scalar,
             )
 
     return hidden_states

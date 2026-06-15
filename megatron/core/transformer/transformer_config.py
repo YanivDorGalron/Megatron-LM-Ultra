@@ -102,6 +102,15 @@ class TransformerConfig(ModelParallelConfig):
     mtp_kd_logit_loss_weight: float = 1.0
     """Weight for MTP logit KD loss, before applying mtp_loss_scaling_factor."""
 
+    mtp_kd_logit_loss_type: str = field(
+        default="kl", metadata={"argparse_meta": {"choices": ["kl", "lk_lambda"]}}
+    )
+    """MTP logit KD loss type. 'kl' keeps the original KL loss, and 'lk_lambda'
+    blends KL with total variation using an adaptive overlap-based coefficient."""
+
+    mtp_lk_eta: float = 3.0
+    """Decay rate for the lk_lambda adaptive schedule."""
+
     mtp_hsm_mode: Optional[str] = field(
         default=None, metadata={"argparse_meta": {"choices": ["uniform_layer_sample"]}}
     )
