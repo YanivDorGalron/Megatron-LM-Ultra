@@ -27,6 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
@@ -59,6 +60,26 @@ else:
     TEColumnParallelGroupedLinear = None
 
 _SEED = 42
+
+
+def _get_cp_local(tensor, cp, cp_rank, cp_token_layout='zigzag', packed_seq_params=None):
+    """Apply the same CP token ownership used by the upstream batch splitter."""
+    if cp_token_layout == 'contiguous':
+        return tensor.chunk(cp)[cp_rank]
+    if packed_seq_params is not None:
+        if not HAVE_TE:
+            pytest.skip("transformer_engine is required for packed CP ownership")
+        import transformer_engine_torch as tex
+
+        cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        indices = tex.thd_get_partitioned_indices(cu_seqlens, tensor.size(0), cp, cp_rank)
+        return tensor.index_select(0, indices.long())
+    chunks = tensor.chunk(2 * cp)
+    return torch.cat((chunks[cp_rank], chunks[2 * cp - cp_rank - 1]))
 
 
 class TestMultiTokenPredictionLayer:
@@ -111,6 +132,110 @@ class TestMultiTokenPredictionLayer:
         torch.testing.assert_close(
             second.grad, torch.tensor([[[0, 0, 0]], [[1, 1, 1]]], dtype=torch.bfloat16)
         )
+
+    def test_hsm_rng_matches_across_tensor_parallel_ranks(self):
+        """Replicated tokens select the same HSM history on every TP rank."""
+        tp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _hsm_mix(history)
+        gathered = [torch.empty_like(mixed) for _ in range(tp)]
+        torch.distributed.all_gather(gathered, mixed, group=tp_group)
+
+        for peer_mixed in gathered[1:]:
+            torch.testing.assert_close(peer_mixed, gathered[0])
+        assert torch.unique(gathered[0][..., 0]).numel() > 1
+
+    def test_hsm_sequence_parallel_shards_keep_position_aligned_selections(
+        self, monkeypatch
+    ):
+        """SP shards select per-position history without moving tokens between TP ranks."""
+        tp = 2
+        local_sequence_length = 6
+        batch_size = 2
+        hidden_size = 4
+        num_states = 3
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_group = get_tensor_model_parallel_group()
+
+        global_start = tp_rank * local_sequence_length
+        local_positions = torch.arange(
+            global_start,
+            global_start + local_sequence_length,
+            dtype=torch.float32,
+            device="cuda",
+        ).view(local_sequence_length, 1, 1)
+        history = [
+            (local_positions * 10 + depth).expand(-1, batch_size, hidden_size)
+            for depth in range(num_states)
+        ]
+        local_depths = (
+            torch.arange(
+                global_start,
+                global_start + local_sequence_length,
+                dtype=torch.long,
+                device="cuda",
+            )
+            % num_states
+        )
+        selection = local_depths.view(1, local_sequence_length, 1, 1).expand(
+            1, -1, batch_size, 1
+        )
+        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: selection)
+
+        local_mixed = _hsm_mix(history)
+        gathered = [torch.empty_like(local_mixed) for _ in range(tp)]
+        torch.distributed.all_gather(gathered, local_mixed, group=tp_group)
+        global_mixed = torch.cat(gathered, dim=0)
+
+        global_positions = torch.arange(
+            tp * local_sequence_length, dtype=torch.float32, device="cuda"
+        ).view(-1, 1, 1)
+        expected_depths = (
+            torch.arange(
+                tp * local_sequence_length, dtype=torch.float32, device="cuda"
+            )
+            % num_states
+        ).view(-1, 1, 1)
+        torch.testing.assert_close(
+            torch.div(global_mixed, 10, rounding_mode='floor'),
+            global_positions.expand(-1, batch_size, hidden_size),
+        )
+        torch.testing.assert_close(
+            global_mixed.remainder(10),
+            expected_depths.expand(-1, batch_size, hidden_size),
+        )
+
+    def test_hsm_rng_replays_during_activation_checkpointing(self):
+        """MCore checkpoint recomputation reuses the original HSM selection."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        history = [
+            torch.full(
+                (32, 2, 4), value, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            for value in (1.0, 2.0, 3.0)
+        ]
+        selections = []
+
+        def mix_with_recording(*states):
+            mixed = _hsm_mix(list(states))
+            selections.append(mixed.detach().clone())
+            return mixed
+
+        mixed = tensor_parallel_checkpoint(mix_with_recording, False, *history)
+        mixed.sum().backward()
+
+        assert len(selections) == 2
+        torch.testing.assert_close(selections[1], selections[0])
+        assert all(state.grad is not None for state in history)
 
     def test_mtp_hsm_defaults_off(self):
         """HSM is opt-in and requires multiple MTP depths to affect the forward pass."""
@@ -254,6 +379,98 @@ class TestMultiTokenPredictionLayer:
             seen_inputs[2], torch.tensor(expected_twice, dtype=torch.float32).view(5, 1, 1)
         )
 
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine is required for packed CP")
+    def test_real_mtp_block_hsm_packed_sequence_parallel_backward(self):
+        """A real MTP block composes BF16 HSM history with packed TP+CP rolling."""
+        tp = 2
+        cp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_rank = get_tensor_model_parallel_rank()
+        cp_rank = get_context_parallel_rank()
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+
+        config = TransformerConfig(
+            mtp_num_layers=3,
+            mtp_hsm=True,
+            num_layers=4,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=True,
+            context_parallel_size=cp,
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            use_transformer_engine=True,
+        )
+        pg_collection = ProcessGroupCollection(cp=cp_group, tp=tp_group, tp_cp=tp_cp_group)
+        mtp = MultiTokenPredictionBlock(
+            config=config, spec=mtp_block_spec, pg_collection=pg_collection
+        )
+
+        class _ScaleLayer(torch.nn.Module):
+            def __init__(self, scale):
+                super().__init__()
+                self.scale = scale
+
+            def forward(
+                self, hidden_states, input_ids, position_ids, padding_mask=None, **kwargs
+            ):
+                return hidden_states * self.scale, input_ids, position_ids, padding_mask
+
+        mtp.layers = torch.nn.ModuleList([_ScaleLayer(scale) for scale in (1.5, 2.0, 2.5)])
+        mtp.train()
+
+        valid_cu_seqlens = torch.tensor([0, 12, 28], dtype=torch.int32, device="cuda")
+        padded_cu_seqlens = torch.tensor([0, 16, 32], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=valid_cu_seqlens,
+            cu_seqlens_kv=valid_cu_seqlens,
+            cu_seqlens_q_padded=padded_cu_seqlens,
+            cu_seqlens_kv_padded=padded_cu_seqlens,
+            max_seqlen_q=16,
+            max_seqlen_kv=16,
+            qkv_format='thd',
+        )
+        full_hidden = (
+            torch.arange(32 * 2 * config.hidden_size, device="cuda")
+            .reshape(32, 2, config.hidden_size)
+            .to(torch.bfloat16)
+            / 128
+        )
+        local_hidden = (
+            _get_cp_local(full_hidden, cp, cp_rank, packed_seq_params=packed_seq_params)
+            .chunk(tp)[tp_rank]
+            .clone()
+            .requires_grad_(True)
+        )
+        cp_local_sequence_length = padded_cu_seqlens[-1].item() // cp
+        input_ids = torch.zeros((2, cp_local_sequence_length), dtype=torch.long, device="cuda")
+        position_ids = torch.arange(cp_local_sequence_length, device="cuda").repeat(2, 1)
+
+        output = mtp(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=local_hidden,
+            attention_mask=torch.ones((1, 1, 1, 1), dtype=torch.bool, device="cuda"),
+            packed_seq_params=packed_seq_params,
+        )
+        mtp_output = output[local_hidden.size(0) :]
+        loss = mtp_output.float().square().mean()
+        loss.backward()
+
+        assert torch.isfinite(loss)
+        assert local_hidden.grad is not None
+        assert torch.isfinite(local_hidden.grad).all()
+        assert torch.count_nonzero(local_hidden.grad) > 0
+
     @pytest.mark.parametrize("packed", [False, True])
     def test_roll_tensor_with_sequence_parallel(self, packed):
         """SP boundary exchange respects ordinary and packed sequence ends."""
@@ -315,23 +532,17 @@ class TestMultiTokenPredictionLayer:
         cp_group = get_context_parallel_group()
         tp_cp_group = get_tensor_and_context_parallel_group()
 
-        sequence_lengths = [5, 11] if packed else [16]
+        sequence_lengths = [8, 24] if packed else [32]
         cu_seqlens_list = [0]
         for length in sequence_lengths:
             cu_seqlens_list.append(cu_seqlens_list[-1] + length)
-        full = torch.arange(16, dtype=torch.float32, device="cuda")
+        full = torch.arange(32, dtype=torch.float32, device="cuda")
         expected_full = torch.empty_like(full)
         expected_grad_full = torch.zeros_like(full)
         for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
             expected_full[start : end - 1] = full[start + 1 : end]
             expected_full[end - 1] = 0
             expected_grad_full[start + 1 : end] = 1
-
-        def get_cp_local(tensor):
-            if cp_token_layout == 'contiguous':
-                return tensor.chunk(cp)[cp_rank]
-            chunks = tensor.chunk(2 * cp)
-            return torch.cat((chunks[cp_rank], chunks[2 * cp - cp_rank - 1]))
 
         packed_seq_params = None
         if packed:
@@ -343,6 +554,9 @@ class TestMultiTokenPredictionLayer:
                 max_seqlen_kv=max(sequence_lengths),
                 qkv_format='thd',
             )
+
+        def get_cp_local(tensor):
+            return _get_cp_local(tensor, cp, cp_rank, cp_token_layout, packed_seq_params)
 
         local = get_cp_local(full).chunk(tp)[tp_rank].clone().requires_grad_(True)
         layout = _build_sequence_parallel_context_roll_layout(
@@ -356,8 +570,9 @@ class TestMultiTokenPredictionLayer:
         assert layout is not None
         assert sum(layout.send_split_sizes) == len(layout.exports)
         assert sum(layout.recv_split_sizes) == len(layout.imports)
-        assert len(layout.exports) <= 2
-        assert len(layout.imports) <= 2
+        max_sparse_boundaries = 2 * len(sequence_lengths) if packed else 2
+        assert len(layout.exports) <= max_sparse_boundaries
+        assert len(layout.imports) <= max_sparse_boundaries
         if packed:
             assert (
                 _build_sequence_parallel_context_roll_layout(
@@ -385,6 +600,131 @@ class TestMultiTokenPredictionLayer:
         torch.testing.assert_close(
             local.grad, get_cp_local(expected_grad_full).chunk(tp)[tp_rank]
         )
+
+    def test_sparse_roll_packed_sequence_with_padding(self):
+        """Packed routing follows padded TE ownership while zeroing true sequence ends."""
+        tp = 2
+        cp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        tp_rank = get_tensor_model_parallel_rank()
+        cp_rank = get_context_parallel_rank()
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+
+        valid_cu_seqlens = torch.tensor([0, 6, 16], dtype=torch.int32, device="cuda")
+        padded_cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=valid_cu_seqlens,
+            cu_seqlens_kv=valid_cu_seqlens,
+            cu_seqlens_q_padded=padded_cu_seqlens,
+            cu_seqlens_kv_padded=padded_cu_seqlens,
+            max_seqlen_q=12,
+            max_seqlen_kv=12,
+            qkv_format='thd',
+        )
+        full = torch.arange(20, dtype=torch.float32, device="cuda")
+        expected_full = torch.zeros_like(full)
+        expected_grad_full = torch.zeros_like(full)
+        for padded_start, valid_length in ((0, 6), (8, 10)):
+            valid_end = padded_start + valid_length
+            expected_full[padded_start : valid_end - 1] = full[padded_start + 1 : valid_end]
+            expected_grad_full[padded_start + 1 : valid_end] = 1
+
+        def get_cp_local(tensor):
+            return _get_cp_local(tensor, cp, cp_rank, packed_seq_params=packed_seq_params)
+
+        local = get_cp_local(full).chunk(tp)[tp_rank].clone().requires_grad_(True)
+        layout = _build_sequence_parallel_context_roll_layout(
+            local.numel(), packed_seq_params, tp_group, cp_group, tp_cp_group
+        )
+        assert layout is not None
+        rolled, _ = roll_tensor_sequence_parallel(
+            local,
+            sequence_parallel=True,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            tp_cp_group=tp_cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        torch.testing.assert_close(rolled, get_cp_local(expected_full).chunk(tp)[tp_rank])
+        rolled.sum().backward()
+        torch.testing.assert_close(
+            local.grad, get_cp_local(expected_grad_full).chunk(tp)[tp_rank]
+        )
+
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine is required for packed CP")
+    @pytest.mark.parametrize("cp", [2, 4])
+    @pytest.mark.parametrize("cp_token_layout", ['zigzag', 'contiguous'])
+    def test_sparse_roll_multidimensional_bf16_with_nonuniform_gradients(
+        self, cp_token_layout, cp
+    ):
+        """Sparse packed routing preserves BF16 values and exact multidimensional gradients."""
+        tp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        tp_rank = get_tensor_model_parallel_rank()
+        cp_rank = get_context_parallel_rank()
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+
+        valid_cu_seqlens = torch.tensor([0, 28, 58], dtype=torch.int32, device="cuda")
+        padded_cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=valid_cu_seqlens,
+            cu_seqlens_kv=valid_cu_seqlens,
+            cu_seqlens_q_padded=padded_cu_seqlens,
+            cu_seqlens_kv_padded=padded_cu_seqlens,
+            max_seqlen_q=32,
+            max_seqlen_kv=32,
+            qkv_format='thd',
+        )
+        full = (
+            torch.arange(64 * 2 * 7, device="cuda").reshape(64, 2, 7).to(torch.bfloat16)
+            / 128
+        )
+        output_grad_full = (
+            torch.arange(1, full.numel() + 1, device="cuda")
+            .reshape_as(full)
+            .to(torch.bfloat16)
+            / 256
+        )
+        expected_full = torch.zeros_like(full)
+        expected_grad_full = torch.zeros_like(full)
+        for padded_start, valid_length in ((0, 28), (32, 30)):
+            valid_end = padded_start + valid_length
+            expected_full[padded_start : valid_end - 1] = full[padded_start + 1 : valid_end]
+            expected_grad_full[padded_start + 1 : valid_end] = output_grad_full[
+                padded_start : valid_end - 1
+            ]
+
+        def get_local(tensor):
+            return _get_cp_local(
+                tensor,
+                cp,
+                cp_rank,
+                cp_token_layout=cp_token_layout,
+                packed_seq_params=packed_seq_params,
+            ).chunk(tp)[tp_rank]
+
+        local = get_local(full).clone().requires_grad_(True)
+        rolled, _ = roll_tensor_sequence_parallel(
+            local,
+            dims=0,
+            sequence_parallel=True,
+            tp_group=tp_group,
+            cp_group=cp_group,
+            tp_cp_group=tp_cp_group,
+            packed_seq_params=packed_seq_params,
+            cp_token_layout=cp_token_layout,
+        )
+        torch.testing.assert_close(rolled, get_local(expected_full))
+        rolled.backward(get_local(output_grad_full))
+        torch.testing.assert_close(local.grad, get_local(expected_grad_full))
 
     @pytest.mark.parametrize("packed", [False, True])
     def test_roll_tensor_with_contiguous_context_parallel(self, packed):
@@ -450,11 +790,7 @@ class TestMultiTokenPredictionLayer:
         cp_group = get_context_parallel_group()
         tp_cp_group = get_tensor_and_context_parallel_group()
 
-        def get_cp_local(tensor):
-            chunks = tensor.chunk(2 * cp)
-            return torch.cat((chunks[cp_rank], chunks[2 * cp - cp_rank - 1]))
-
-        packed_sequence_lengths = ((17, 31, 257, 1023, 2047, 4817), (*([127] * 64), 64))
+        packed_sequence_lengths = ((20, 32, 256, 1024, 2048, 4812), (128,) * 64)
         for sequence_lengths in packed_sequence_lengths:
             cu_seqlens_list = [0]
             for length in sequence_lengths:
@@ -475,6 +811,9 @@ class TestMultiTokenPredictionLayer:
                 expected_full[start : end - 1] = full[start + 1 : end]
                 expected_full[end - 1] = 0
                 expected_grad_full[start] = 0
+            def get_cp_local(tensor):
+                return _get_cp_local(tensor, cp, cp_rank, packed_seq_params=packed_seq_params)
+
             local = get_cp_local(full).chunk(tp)[tp_rank].clone().requires_grad_(True)
             layout = _build_sequence_parallel_context_roll_layout(
                 local.numel(), packed_seq_params, tp_group, cp_group, tp_cp_group
@@ -499,6 +838,39 @@ class TestMultiTokenPredictionLayer:
             torch.testing.assert_close(
                 local.grad, get_cp_local(expected_grad_full).chunk(tp)[tp_rank]
             )
+
+    def test_sparse_roll_cache_invalidates_after_in_place_metadata_change(self):
+        """Mutating packed metadata on one instance builds a fresh sparse routing layout."""
+        tp = 2
+        cp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+        cu_seqlens = torch.tensor([0, 8, 32], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=24,
+            max_seqlen_kv=24,
+            qkv_format='thd',
+        )
+
+        first_layout = _build_sequence_parallel_context_roll_layout(
+            8, packed_seq_params, tp_group, cp_group, tp_cp_group
+        )
+        assert first_layout is not None
+        assert len(packed_seq_params._mtp_roll_layout_cache) == 1
+
+        cu_seqlens[1] = 12
+        second_layout = _build_sequence_parallel_context_roll_layout(
+            8, packed_seq_params, tp_group, cp_group, tp_cp_group
+        )
+        assert second_layout is not None
+        assert second_layout is not first_layout
+        assert len(packed_seq_params._mtp_roll_layout_cache) == 2
 
     def test_mtp_detach_heads_config(self):
         """Test that mtp_detach_heads config defaults to False."""
@@ -1534,7 +1906,7 @@ class TestMultiTokenPrediction:
     @pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp, dtype):
-        """Packed rolling follows complete-stream CP ownership for values and ids."""
+        """Packed rolling follows per-document CP ownership for values and ids."""
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
         cp_group = get_context_parallel_group() if cp > 1 else None
         cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
@@ -1566,27 +1938,26 @@ class TestMultiTokenPrediction:
             assert sum_val.numel() == 1
             assert no_sum is None
         else:
-            full = torch.arange(16, dtype=dtype, device="cuda").unsqueeze(0)
-            expected_full = torch.tensor(
-                [1, 2, 3, 4, 0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0],
-                dtype=dtype,
-                device="cuda",
-            ).unsqueeze(0)
-            chunks = full.chunk(2 * cp, dim=-1)
-            tensor = torch.cat((chunks[cp_rank], chunks[2 * cp - cp_rank - 1]), dim=-1)
-            if dtype.is_floating_point:
-                tensor = tensor.clone().requires_grad_(True)
-            expected_chunks = expected_full.chunk(2 * cp, dim=-1)
-            expected = torch.cat(
-                (expected_chunks[cp_rank], expected_chunks[2 * cp - cp_rank - 1]), dim=-1
-            )
-            cu_seqlens = torch.tensor([0, 5, 16], dtype=torch.int32).cuda()
+            full = torch.arange(16, dtype=dtype, device="cuda")
+            cu_seqlens = torch.tensor([0, 4, 16], dtype=torch.int32, device="cuda")
             packed_seq_params = PackedSeqParams(
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=11,
-                max_seqlen_kv=11,
+                max_seqlen_q=12,
+                max_seqlen_kv=12,
                 qkv_format='thd',
+            )
+            expected_full = torch.empty_like(full)
+            for start, end in ((0, 4), (4, 16)):
+                expected_full[start : end - 1] = full[start + 1 : end]
+                expected_full[end - 1] = 0
+            tensor = _get_cp_local(
+                full, cp, cp_rank, packed_seq_params=packed_seq_params
+            )
+            if dtype.is_floating_point:
+                tensor = tensor.clone().requires_grad_(True)
+            expected = _get_cp_local(
+                expected_full, cp, cp_rank, packed_seq_params=packed_seq_params
             )
             rolled, sum_val = roll_tensor(
                 tensor, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
@@ -1595,14 +1966,12 @@ class TestMultiTokenPrediction:
             assert sum_val.numel() == 1, "Sum should be a scalar"
             if dtype.is_floating_point:
                 expected_grad_full = torch.ones_like(full)
-                expected_grad_full[..., [0, 5]] = 0
-                expected_grad_chunks = expected_grad_full.chunk(2 * cp, dim=-1)
-                expected_grad = torch.cat(
-                    (
-                        expected_grad_chunks[cp_rank],
-                        expected_grad_chunks[2 * cp - cp_rank - 1],
-                    ),
-                    dim=-1,
+                expected_grad_full[[0, 4]] = 0
+                expected_grad = _get_cp_local(
+                    expected_grad_full,
+                    cp,
+                    cp_rank,
+                    packed_seq_params=packed_seq_params,
                 )
                 rolled.sum().backward()
                 torch.testing.assert_close(tensor.grad, expected_grad)

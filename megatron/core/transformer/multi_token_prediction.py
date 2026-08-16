@@ -581,7 +581,7 @@ def _build_sequence_parallel_context_roll_layout(
     tp_cp_group=None,
     cp_token_layout='zigzag',
 ):
-    """Build sparse boundary routing for zigzag or contiguous CP ownership."""
+    """Build sparse boundary routing for packed/unpacked zigzag or contiguous CP ownership."""
     tp_size = tp_group.size() if tp_group is not None else 1
     cp_size = cp_group.size()
     tp_rank = torch.distributed.get_rank(group=tp_group) if tp_group is not None else 0
@@ -618,6 +618,11 @@ def _build_sequence_parallel_context_roll_layout(
         assert cu_seqlens_tensor is not None, (
             "Packed sequence parameters must provide cu_seqlens_q."
         )
+        ownership_cu_seqlens_tensor = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else cu_seqlens_tensor
+        )
         packed_cache = getattr(packed_seq_params, "_mtp_roll_layout_cache", None)
         if packed_cache is None:
             packed_cache = {}
@@ -625,20 +630,56 @@ def _build_sequence_parallel_context_roll_layout(
         packed_cache_key = topology_key + (
             id(cu_seqlens_tensor),
             getattr(cu_seqlens_tensor, "_version", 0),
+            id(ownership_cu_seqlens_tensor),
+            getattr(ownership_cu_seqlens_tensor, "_version", 0),
         )
         if packed_cache_key in packed_cache:
             return packed_cache[packed_cache_key]
         cu_seqlens = tuple(int(value) for value in cu_seqlens_tensor.cpu().tolist())
-        if not cu_seqlens or cu_seqlens[0] != 0 or cu_seqlens[-1] != total_sequence_length:
+        ownership_cu_seqlens = (
+            cu_seqlens
+            if ownership_cu_seqlens_tensor is cu_seqlens_tensor
+            else tuple(int(value) for value in ownership_cu_seqlens_tensor.cpu().tolist())
+        )
+        if (
+            not cu_seqlens
+            or len(cu_seqlens) != len(ownership_cu_seqlens)
+            or cu_seqlens[0] != 0
+            or ownership_cu_seqlens[0] != 0
+            or ownership_cu_seqlens[-1] != total_sequence_length
+        ):
             return None
+        # Measure real tokens per document; these lengths determine where rolling must stop.
+        valid_sequence_lengths = tuple(
+            end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])
+        )
+        # Measure physical slots per document; TE uses the padded lengths for CP ownership.
+        ownership_sequence_lengths = tuple(
+            end - start
+            for start, end in zip(ownership_cu_seqlens[:-1], ownership_cu_seqlens[1:])
+        )
+        if any(
+            valid_length <= 0 or ownership_length < valid_length
+            for valid_length, ownership_length in zip(
+                valid_sequence_lengths, ownership_sequence_lengths
+            )
+        ):
+            return None
+        # Combine each padded start with its real length so successor edges exclude padding.
+        sequence_spans = tuple(
+            (ownership_start, ownership_start + valid_length)
+            for ownership_start, valid_length in zip(
+                ownership_cu_seqlens[:-1], valid_sequence_lengths
+            )
+        )
     else:
         packed_cache = None
         packed_cache_key = None
         cu_seqlens = (0, total_sequence_length)
+        ownership_cu_seqlens = cu_seqlens
+        sequence_spans = ((0, total_sequence_length),)
         if topology_key in _SEQUENCE_PARALLEL_CONTEXT_ROLL_LAYOUT_CACHE:
             return _SEQUENCE_PARALLEL_CONTEXT_ROLL_LAYOUT_CACHE[topology_key]
-    if any(end <= start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])):
-        return None
 
     if tp_group is None:
         tp_cp_group = cp_group
@@ -658,35 +699,52 @@ def _build_sequence_parallel_context_roll_layout(
 
     ownership_spans = []
     if cp_token_layout == 'zigzag':
-        chunk_length = total_sequence_length // (2 * cp_size)
-        for chunk_idx in range(2 * cp_size):
-            if chunk_idx < cp_size:
-                owner_cp_rank = chunk_idx
-                cp_local_chunk_start = 0
-            else:
-                owner_cp_rank = 2 * cp_size - chunk_idx - 1
-                cp_local_chunk_start = chunk_length
-            position_in_chunk = 0
-            while position_in_chunk < chunk_length:
-                cp_local_position = cp_local_chunk_start + position_in_chunk
-                owner_tp_rank, owner_local_idx = divmod(cp_local_position, sequence_length)
-                position_end = min(
-                    chunk_length, (owner_tp_rank + 1) * sequence_length - cp_local_chunk_start
-                )
-                owner_global_rank = coordinate_global_rank(owner_cp_rank, owner_tp_rank)
-                global_start = chunk_idx * chunk_length + position_in_chunk
-                ownership_spans.append(
-                    (
-                        global_start,
-                        chunk_idx * chunk_length + position_end,
-                        group_rank_by_global_rank[owner_global_rank],
-                        owner_local_idx,
+        cp_local_document_start = 0
+        # TE applies zigzag ownership independently to every packed document.
+        for document_start, document_end in zip(
+            ownership_cu_seqlens[:-1], ownership_cu_seqlens[1:]
+        ):
+            document_length = document_end - document_start
+            if document_length % (2 * cp_size) != 0:
+                return None
+            chunk_length = document_length // (2 * cp_size)
+            # Enumerate the 2*CP mirrored chunks that TE assigns to the CP ranks.
+            for chunk_idx in range(2 * cp_size):
+                if chunk_idx < cp_size:
+                    owner_cp_rank = chunk_idx
+                    cp_local_chunk_start = cp_local_document_start
+                else:
+                    owner_cp_rank = 2 * cp_size - chunk_idx - 1
+                    cp_local_chunk_start = cp_local_document_start + chunk_length
+                position_in_chunk = 0
+                # Split a CP chunk wherever it crosses a TP/SP shard boundary so every
+                # emitted span has one owner rank and a valid rank-local offset.
+                while position_in_chunk < chunk_length:
+                    cp_local_position = cp_local_chunk_start + position_in_chunk
+                    owner_tp_rank, owner_local_idx = divmod(cp_local_position, sequence_length)
+                    position_end = min(
+                        chunk_length,
+                        (owner_tp_rank + 1) * sequence_length - cp_local_chunk_start,
                     )
-                )
-                position_in_chunk = position_end
+                    owner_global_rank = coordinate_global_rank(owner_cp_rank, owner_tp_rank)
+                    global_start = document_start + chunk_idx * chunk_length + position_in_chunk
+                    ownership_spans.append(
+                        (
+                            global_start,
+                            document_start + chunk_idx * chunk_length + position_end,
+                            group_rank_by_global_rank[owner_global_rank],
+                            owner_local_idx,
+                        )
+                    )
+                    position_in_chunk = position_end
+            cp_local_document_start += document_length // cp_size
+        if cp_local_document_start != sequence_length * tp_size:
+            return None
     else:
         cp_local_length = total_sequence_length // cp_size
+        # Contiguous ownership gives each CP rank one global interval in sequence order.
         for owner_cp_rank in range(cp_size):
+            # Divide that CP-local interval into the sequence shards owned by the TP ranks.
             for owner_tp_rank in range(tp_size):
                 global_start = owner_cp_rank * cp_local_length + owner_tp_rank * sequence_length
                 owner_global_rank = coordinate_global_rank(owner_cp_rank, owner_tp_rank)
@@ -703,17 +761,19 @@ def _build_sequence_parallel_context_roll_layout(
     remote_edges = []
     output_span_idx = input_span_idx = sequence_idx = 0
     current_group_rank = group_rank_by_global_rank[global_rank]
+    # Sweep output ownership, successor-input ownership, and valid document spans together.
+    # This identifies local copies and the sparse one-token edges that cross rank boundaries.
     while (
         output_span_idx < len(ownership_spans)
         and input_span_idx < len(ownership_spans)
-        and sequence_idx < len(cu_seqlens) - 1
+        and sequence_idx < len(sequence_spans)
     ):
         output_start, output_end, output_owner, output_local_start = ownership_spans[
             output_span_idx
         ]
         input_start, input_end, input_owner, input_local_start = ownership_spans[input_span_idx]
-        sequence_start = cu_seqlens[sequence_idx]
-        sequence_output_end = cu_seqlens[sequence_idx + 1] - 1
+        sequence_start, sequence_end = sequence_spans[sequence_idx]
+        sequence_output_end = sequence_end - 1
         shifted_input_start = input_start - 1
         shifted_input_end = input_end - 1
         interval_start = max(output_start, shifted_input_start, sequence_start)
@@ -743,6 +803,7 @@ def _build_sequence_parallel_context_roll_layout(
             sequence_idx += 1
 
     copies = []
+    # Coalesce adjacent local intervals so the autograd function performs fewer tensor copies.
     for output_start, output_end, input_start in sorted(copy_intervals):
         if (
             copies
@@ -754,6 +815,7 @@ def _build_sequence_parallel_context_roll_layout(
         else:
             copies.append((output_start, output_end, input_start))
 
+    # Pack outgoing boundary tokens by destination rank for all_to_all_single.
     exports = tuple(
         (output_owner, input_local_idx)
         for output_owner, _, input_owner, input_local_idx in sorted(
@@ -761,6 +823,7 @@ def _build_sequence_parallel_context_roll_layout(
         )
         if input_owner == current_group_rank
     )
+    # Pack incoming boundary positions by source rank in the matching receive order.
     imports = tuple(
         (input_owner, output_local_idx)
         for output_owner, output_local_idx, input_owner, _ in sorted(
@@ -768,6 +831,7 @@ def _build_sequence_parallel_context_roll_layout(
         )
         if output_owner == current_group_rank
     )
+    # Count tokens per peer to describe the variable-size all-to-all exchange.
     send_split_sizes = tuple(
         sum(destination == rank for destination, _ in exports)
         for rank in range(len(tp_cp_global_ranks))
