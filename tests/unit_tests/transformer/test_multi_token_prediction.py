@@ -19,8 +19,13 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_tensor_and_context_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
@@ -117,6 +122,83 @@ class TestMultiTokenPredictionLayer:
         mixed.sum().backward()
         torch.testing.assert_close(first.grad, torch.tensor([1.0, 0.0, 1.0]).view(3, 1, 1))
         torch.testing.assert_close(newest.grad, torch.tensor([0.0, 1.0, 0.0]).view(3, 1, 1))
+
+    def test_hsm_rng_matches_across_replicated_tensor_parallel_ranks(self):
+        """Replicated tokens select the same HSM history on every TP rank."""
+        tp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _hsm_mix(history)
+        gathered = [torch.empty_like(mixed) for _ in range(tp)]
+        torch.distributed.all_gather(gathered, mixed, group=tp_group)
+
+        for peer_mixed in gathered[1:]:
+            torch.testing.assert_close(peer_mixed, gathered[0])
+        assert torch.unique(gathered[0][..., 0]).numel() > 1
+
+    def test_hsm_rng_differs_across_sequence_parallel_owners(self):
+        """Disjoint TP+CP token shards receive different tracked RNG slices."""
+        tp = 2
+        cp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+
+        history = [
+            torch.full((64, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in range(1, 8)
+        ]
+        mixed = _hsm_mix(
+            history,
+            sequence_parallel=True,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
+        selections = mixed[..., 0].to(torch.long)
+        gathered = [torch.empty_like(selections) for _ in range(tp * cp)]
+        torch.distributed.all_gather(gathered, selections, group=tp_cp_group)
+
+        assert len({tuple(mask.cpu().flatten().tolist()) for mask in gathered}) == tp * cp
+        assert all(torch.unique(mask).numel() > 1 for mask in gathered)
+
+    def test_hsm_rng_replays_during_activation_checkpointing(self):
+        """MCore checkpoint recomputation reuses the original HSM selection."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+        history = [
+            torch.full(
+                (32, 2, 4), value, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            for value in (1.0, 2.0, 3.0)
+        ]
+        selections = []
+
+        def mix_with_recording(*states):
+            mixed = _hsm_mix(
+                list(states),
+                sequence_parallel=True,
+                tp_group=tp_group,
+            )
+            selections.append(mixed.detach().clone())
+            return mixed
+
+        mixed = tensor_parallel_checkpoint(mix_with_recording, False, *history)
+        mixed.sum().backward()
+
+        assert len(selections) == 2
+        torch.testing.assert_close(selections[1], selections[0])
+        assert all(state.grad is not None for state in history)
 
     def test_mtp_hsm_defaults_off(self):
         """HSM is opt-in and requires multiple MTP depths to affect the forward pass."""
