@@ -38,6 +38,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
+    get_pg_size,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -66,17 +67,32 @@ else:
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
-def _hsm_mix(hidden_states_list: List[Tensor]) -> Tensor:
+def _hsm_mix(
+    hidden_states_list: List[Tensor],
+    *,
+    sequence_parallel: bool = False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tensor:
     """Select one accumulated hidden state independently for every token.
 
-    The data-parallel RNG stream is shared by model-parallel ranks, which keeps
-    selections consistent when those ranks hold different shards of the same
-    activation.
+    All model-parallel ranks draw the same full logical-sequence mask from the
+    data-parallel RNG stream. Sequence- and context-parallel ranks then select
+    disjoint slices, while TP ranks that replicate sequence positions select the
+    same slice. This keeps selections independent across logical token shards
+    without desynchronizing the shared RNG stream.
     """
     num_states = len(hidden_states_list)
     assert num_states > 0, "Hidden State Mixing requires at least one state."
 
     sequence_length, batch_size, hidden_size = hidden_states_list[0].shape
+    sp_size = get_pg_size(tp_group) if sequence_parallel else 1
+    sp_rank = get_pg_rank(tp_group) if sequence_parallel else 0
+    cp_size = get_pg_size(cp_group)
+    cp_rank = get_pg_rank(cp_group)
+    sequence_owner_count = sp_size * cp_size
+    sequence_owner_rank = cp_rank * sp_size + sp_rank
+
     rng_tracker = tensor_parallel.get_cuda_rng_tracker()
     rng_context = (
         rng_tracker.fork(tensor_parallel.get_data_parallel_rng_tracker_name())
@@ -84,11 +100,13 @@ def _hsm_mix(hidden_states_list: List[Tensor]) -> Tensor:
         else nullcontext()
     )
     with rng_context:
-        indices = torch.randint(
+        all_indices = torch.randint(
             num_states,
-            (1, sequence_length, batch_size, 1),
+            (1, sequence_owner_count * sequence_length, batch_size, 1),
             device=hidden_states_list[0].device,
         )
+    owner_start = sequence_owner_rank * sequence_length
+    indices = all_indices[:, owner_start : owner_start + sequence_length]
 
     stacked = torch.stack(hidden_states_list, dim=0)
     return torch.gather(
@@ -2537,7 +2555,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                     .permute(0, 3, 1, 2)
                     .unbind(0)
                 ) + [newest_entry]
-                hidden_states_input = _hsm_mix(hsm_history)
+                hidden_states_input = _hsm_mix(
+                    hsm_history,
+                    sequence_parallel=self.sequence_parallel,
+                    tp_group=self.tp_group,
+                    cp_group=self.cp_group,
+                )
             else:
                 hidden_states_input = hidden_states
 

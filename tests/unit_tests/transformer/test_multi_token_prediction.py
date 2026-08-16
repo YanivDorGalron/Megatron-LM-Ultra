@@ -152,6 +152,35 @@ class TestMultiTokenPredictionLayer:
             torch.testing.assert_close(peer_mixed, gathered[0])
         assert torch.unique(gathered[0][..., 0]).numel() > 1
 
+    def test_hsm_rng_differs_across_sequence_parallel_owners(self):
+        """Actual HSM RNG draws independent masks for disjoint TP+CP token shards."""
+        tp = 2
+        cp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+
+        history = [
+            torch.full((64, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in range(7)
+        ]
+        mixed = _hsm_mix(
+            history,
+            sequence_parallel=True,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
+        selections = mixed[..., 0].to(torch.long)
+        gathered = [torch.empty_like(selections) for _ in range(tp * cp)]
+        torch.distributed.all_gather(gathered, selections, group=tp_cp_group)
+
+        assert len({tuple(mask.cpu().flatten().tolist()) for mask in gathered}) == tp * cp
+        assert all(torch.unique(mask).numel() > 1 for mask in gathered)
+
     def test_hsm_sequence_parallel_shards_keep_position_aligned_selections(
         self, monkeypatch
     ):
@@ -214,9 +243,10 @@ class TestMultiTokenPredictionLayer:
         )
 
     def test_hsm_rng_replays_during_activation_checkpointing(self):
-        """MCore checkpoint recomputation reuses the original HSM selection."""
+        """MCore checkpoint recomputation reuses a sequence-owner HSM selection."""
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
         history = [
             torch.full(
                 (32, 2, 4), value, dtype=torch.float32, device="cuda", requires_grad=True
@@ -226,7 +256,11 @@ class TestMultiTokenPredictionLayer:
         selections = []
 
         def mix_with_recording(*states):
-            mixed = _hsm_mix(list(states))
+            mixed = _hsm_mix(
+                list(states),
+                sequence_parallel=True,
+                tp_group=tp_group,
+            )
             selections.append(mixed.detach().clone())
             return mixed
 
