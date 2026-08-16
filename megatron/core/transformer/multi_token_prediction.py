@@ -90,6 +90,10 @@ def _hsm_mix(hidden_states_list: List[Tensor]) -> Tensor:
         )
 
     stacked = torch.stack(hidden_states_list, dim=0)
+    # roll_tensor zeroes positions without a local continuation; use the newest state there.
+    invalid_locations = stacked.eq(0).all(dim=-1, keepdim=True)
+    selected_is_invalid = torch.gather(invalid_locations, dim=0, index=indices)
+    indices = indices.masked_fill(selected_is_invalid, num_states - 1)
     return torch.gather(
         stacked, dim=0, index=indices.expand(-1, -1, -1, hidden_size)
     ).squeeze(0)

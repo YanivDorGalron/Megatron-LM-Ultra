@@ -104,6 +104,20 @@ class TestMultiTokenPredictionLayer:
             second.grad, torch.tensor([[[0, 0, 0]], [[1, 1, 1]]], dtype=torch.bfloat16)
         )
 
+    def test_hsm_mix_uses_newest_state_for_zero_roll_sentinel(self, monkeypatch):
+        """A sampled zero produced by an invalid roll selects the newest hidden state."""
+        first = torch.tensor([1.0, 0.0, 3.0]).view(3, 1, 1).requires_grad_()
+        newest = torch.tensor([11.0, 12.0, 13.0]).view(3, 1, 1).requires_grad_()
+        selection = torch.zeros((1, 3, 1, 1), dtype=torch.long)
+        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: selection)
+
+        mixed = _hsm_mix([first, newest])
+
+        torch.testing.assert_close(mixed, torch.tensor([1.0, 12.0, 3.0]).view(3, 1, 1))
+        mixed.sum().backward()
+        torch.testing.assert_close(first.grad, torch.tensor([1.0, 0.0, 1.0]).view(3, 1, 1))
+        torch.testing.assert_close(newest.grad, torch.tensor([0.0, 1.0, 0.0]).view(3, 1, 1))
+
     def test_mtp_hsm_defaults_off(self):
         """HSM is opt-in and requires multiple MTP depths to affect the forward pass."""
         config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
@@ -133,7 +147,12 @@ class TestMultiTokenPredictionLayer:
         )
         torch.testing.assert_close(output[2:], torch.ones_like(hidden_states))
 
-    @pytest.mark.parametrize(("training", "expected_second_input"), [(True, 0.0), (False, 1.0)])
+    @pytest.mark.parametrize(
+        ("training", "expected_second_input"), [
+            (True, [1.0, 2.0]),
+            (False, [2.0, 2.0]),
+        ]
+    )
     def test_hsm_runs_only_during_training(self, monkeypatch, training, expected_second_input):
         """The block applies HSM in training and leaves evaluation deterministic."""
         config = TransformerConfig(
@@ -155,6 +174,7 @@ class TestMultiTokenPredictionLayer:
             training=training,
             vp_stage=None,
             mtp_use_repeated_layer=False,
+            cp_group=None,
             layers=[_IncrementLayer(), _IncrementLayer()],
         )
         monkeypatch.setattr(
@@ -163,7 +183,7 @@ class TestMultiTokenPredictionLayer:
             lambda high, size, device=None: torch.zeros(size, dtype=torch.long, device=device),
         )
 
-        hidden_states = torch.zeros(2, 1, config.hidden_size)
+        hidden_states = torch.ones(2, 1, config.hidden_size)
         MultiTokenPredictionBlock.forward(
             block,
             input_ids=torch.zeros(1, 2, dtype=torch.long),
@@ -174,7 +194,8 @@ class TestMultiTokenPredictionLayer:
 
         torch.testing.assert_close(seen_inputs[0], hidden_states)
         torch.testing.assert_close(
-            seen_inputs[1], torch.full_like(hidden_states, expected_second_input)
+            seen_inputs[1],
+            torch.tensor(expected_second_input).view(2, 1, 1).expand_as(hidden_states),
         )
 
     @pytest.mark.parametrize("packed", [False, True])
@@ -229,8 +250,8 @@ class TestMultiTokenPredictionLayer:
             packed_seq_params=packed_seq_params,
         )
 
-        expected_once = [1, 2, 0, 4, 0] if packed else [1, 2, 3, 4, 0]
-        expected_twice = [2, 0, 0, 0, 0] if packed else [2, 3, 4, 0, 0]
+        expected_once = [1, 2, 12, 4, 14] if packed else [1, 2, 3, 4, 14]
+        expected_twice = [2, 12, 22, 14, 24] if packed else [2, 3, 4, 14, 24]
         torch.testing.assert_close(seen_inputs[0], hidden_states)
         torch.testing.assert_close(
             seen_inputs[1], torch.tensor(expected_once, dtype=torch.float32).view(5, 1, 1)
